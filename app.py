@@ -144,6 +144,8 @@ def load_config() -> dict:
     if source.exists():
         try:
             data = json.loads(source.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("config root is not an object")
             merged = dict(DEFAULT_CONFIG)
             merged.update(data)
             # Migrate the old single-provider (Gemini-only) config schema.
@@ -155,8 +157,15 @@ def load_config() -> dict:
             # an old version of the config file.
             for legacy_key in ("api_key", "api_key_enc", "model"):
                 merged.pop(legacy_key, None)
+            # A hand-edited or damaged file must not stop the app from starting.
+            if merged.get("provider") not in PROVIDER_LABELS:
+                merged["provider"] = DEFAULT_CONFIG["provider"]
+            try:
+                merged["delay_seconds"] = max(DELAY_MIN, min(DELAY_MAX, int(merged["delay_seconds"])))
+            except (TypeError, ValueError):
+                merged["delay_seconds"] = DEFAULT_CONFIG["delay_seconds"]
             return merged
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, TypeError, OSError):  # ValueError covers JSON/Unicode decode errors
             pass
     return dict(DEFAULT_CONFIG)
 
@@ -172,6 +181,16 @@ def save_config(cfg: dict) -> None:
         os.chmod(CONFIG_PATH, 0o600)
     except OSError:
         pass
+
+
+class _AbortBatch(Exception):
+    """Raised by a per-file worker for an error that will repeat for every
+    remaining file (bad key, no access to the model), so the batch stops
+    instead of failing - and pausing - once per photo."""
+
+
+def _is_fatal_gemini_error(e: genai_errors.APIError) -> bool:
+    return getattr(e, "code", None) in (401, 403, 404) or "API_KEY_INVALID" in str(e)
 
 
 def _is_quota_error(e: genai_errors.APIError) -> bool:
@@ -690,6 +709,7 @@ class ComboField(InputField):
             max_off = max(0, len(self._values) - vis)
             state["offset"] = max(0, min(max_off, state["offset"] + (-1 if ev.delta > 0 else 1)))
             render()
+            return "break"  # otherwise the page behind the list scrolls too
 
         cv.bind("<Motion>", on_motion)
         cv.bind("<Leave>", on_leave)
@@ -1121,6 +1141,10 @@ class App(tk.Tk):
         # The key we last auto-fetched the model list for, per provider - so the
         # same key is never fetched twice on its own (the button always can).
         self._auto_tried: dict[str, str] = {}
+        # The last model list fetched per provider, so switching providers back and
+        # forth doesn't throw the fetched list away (the key is not re-fetched).
+        self._fetched_models: dict[str, list[str]] = {}
+        self._dup_stems: set[str] = set()
 
         self._apply_theme()
         self._build_ui()
@@ -1432,7 +1456,7 @@ class App(tk.Tk):
             self._models[prev] = self.var_model.get().strip()
         self._active_provider = new
         self.var_api_key.set(self._keys.get(new, ""))
-        presets = MODEL_PRESETS_BY_PROVIDER[new]
+        presets = self._fetched_models.get(new) or MODEL_PRESETS_BY_PROVIDER[new]
         self.combo_model.set_values(presets)
         self.var_model.set(self._models.get(new) or presets[0])
         self.var_model_status.set("")
@@ -1529,7 +1553,8 @@ class App(tk.Tk):
             err = ConnectionError(f"Не удалось соединиться с OpenAI ({type(e).__name__}).")
             self.after(0, lambda: self._on_models_fetched(None, err, "openai"))
         except Exception as e:  # noqa: BLE001
-            self.after(0, lambda: self._on_models_fetched(None, e, "openai"))
+            err = e  # `e` is unbound once the except block ends, before the lambda runs
+            self.after(0, lambda: self._on_models_fetched(None, err, "openai"))
 
     def _fetch_models_worker(self, api_key: str):
         try:
@@ -1568,7 +1593,8 @@ class App(tk.Tk):
             )
             self.after(0, lambda: self._on_models_fetched(None, err, "gemini"))
         except Exception as e:  # noqa: BLE001
-            self.after(0, lambda: self._on_models_fetched(None, e, "gemini"))
+            err = e  # `e` is unbound once the except block ends, before the lambda runs
+            self.after(0, lambda: self._on_models_fetched(None, err, "gemini"))
 
     def _on_models_fetched(self, names, error, provider=None):
         self._models_loading = False
@@ -1596,6 +1622,7 @@ class App(tk.Tk):
             )
             return
 
+        self._fetched_models[self.var_provider.get()] = list(names)
         self.combo_model.set_values(names)
         if self.var_model.get() not in names:
             self.var_model.set(names[0])
@@ -1653,7 +1680,10 @@ class App(tk.Tk):
         }
 
     def _on_close(self):
-        save_config(self._current_cfg())
+        try:
+            save_config(self._current_cfg())
+        except Exception:  # noqa: BLE001 - a failed save must never keep the window open
+            pass
         self.destroy()
 
     # ---------- logging ----------
@@ -1685,10 +1715,12 @@ class App(tk.Tk):
         if not cfg["model"]:
             messagebox.showerror("Ошибка", "Укажите модель.")
             return
-        input_dir = Path(cfg["input_folder"])
-        if not input_dir.is_dir():
+        # Path("") is Path("."), which would silently pass is_dir() and scan the
+        # current directory - so an empty field has to be rejected explicitly.
+        if not cfg["input_folder"] or not Path(cfg["input_folder"]).is_dir():
             messagebox.showerror("Ошибка", "Укажите существующую папку с исходными фото.")
             return
+        input_dir = Path(cfg["input_folder"])
         if not cfg["prompt"]:
             messagebox.showerror("Ошибка", "Введите промпт.")
             return
@@ -1704,16 +1736,27 @@ class App(tk.Tk):
         except OSError:
             pass
 
-        save_config(cfg)
+        try:
+            save_config(cfg)
+        except OSError as e:
+            self._log(f"⚠ Не удалось сохранить настройки: {e}", "warn")
 
-        files = sorted(
-            p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS
-        )
+        try:
+            files = sorted(
+                p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS
+            )
+        except OSError as e:
+            messagebox.showerror("Ошибка", f"Не удалось прочитать папку с фото:\n{e}")
+            return
         if not files:
             messagebox.showinfo("Нет файлов", "В указанной папке не найдено изображений.")
             return
 
-        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Ошибка", f"Не удалось создать папку для результатов:\n{e}")
+            return
 
         self.stop_event.clear()
         self.progress.configure(maximum=len(files), value=0)
@@ -1732,61 +1775,102 @@ class App(tk.Tk):
         self.stop_event.set()
         self._log("Остановка запрошена, дождитесь завершения текущего файла...", "warn")
 
-    def _finish(self, processed: int, total: int, errors: int, aborted_quota: bool):
+    def _finish(self, processed: int, total: int, errors: int, abort_note: str = ""):
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
-        suffix = " — остановлено: превышена суточная квота API" if aborted_quota else ""
+        suffix = f" — остановлено: {abort_note}" if abort_note else ""
         self.var_status.set(f"Готово: {processed}/{total} (ошибок: {errors}){suffix}")
         self._log(f"=== Обработка завершена: {processed}/{total}, ошибок: {errors}{suffix} ===", "info")
 
     # ---------- worker ----------
+    @staticmethod
+    def _find_duplicate_stems(files: list[Path]) -> set[str]:
+        seen, dups = set(), set()
+        for p in files:
+            key = p.stem.lower()
+            (dups if key in seen else seen).add(key)
+        return dups
+
+    def _out_stem(self, src_path: Path) -> str:
+        """Output file name without extension. Normally the source's own name; when
+        a.jpg and a.png sit in the same folder both would become a.png, so the
+        source extension is added to keep one result from overwriting the other."""
+        if src_path.stem.lower() in self._dup_stems:
+            return f"{src_path.stem}_{src_path.suffix.lstrip('.').lower()}"
+        return src_path.stem
+
+    def _ui(self, fn, *args, **kwargs):
+        """Runs a widget update on the Tk thread (called from the batch thread)."""
+        self.after(0, lambda: fn(*args, **kwargs))
+
     def _run_batch(self, cfg: dict, files: list[Path], output_dir: Path):
-        provider = cfg["provider"]
-        if provider == "openai":
-            client = openai.OpenAI(api_key=cfg["api_key"], timeout=GENERATE_TIMEOUT_S)
-            process_one = self._process_one_openai
-        else:
-            client = genai.Client(
-                api_key=cfg["api_key"],
-                http_options=genai_types.HttpOptions(timeout=GENERATE_TIMEOUT_MS),
-            )
-            process_one = self._process_one_gemini
-        prompt = cfg["prompt"]
-        model = cfg["model"]
-        delay = max(1, cfg["delay_seconds"])
         total = len(files)
         processed = 0
         errors = 0
-        aborted_quota = False
-
-        for idx, path in enumerate(files, start=1):
-            if self.stop_event.is_set():
-                self._log("Остановлено пользователем.", "warn")
-                break
-
-            self._log(f"[{idx}/{total}] Обработка {path.name}...")
-            ok, quota_exhausted = process_one(client, model, prompt, path, output_dir)
-            processed += 1
-            if not ok:
-                errors += 1
-
-            self.progress.configure(value=idx)
-            self.var_status.set(f"{idx}/{total}")
-
-            if quota_exhausted:
-                self._log(
-                    "✗ Похоже, исчерпана суточная квота API (RESOURCE_EXHAUSTED, per-day). "
-                    "Остановка пакета — повторные попытки прямо сейчас не помогут, "
-                    "проверьте лимиты в AI Studio → Usage.",
-                    "err",
+        abort_note = ""
+        try:
+            provider = cfg["provider"]
+            if provider == "openai":
+                client = openai.OpenAI(api_key=cfg["api_key"], timeout=GENERATE_TIMEOUT_S)
+                process_one = self._process_one_openai
+            else:
+                client = genai.Client(
+                    api_key=cfg["api_key"],
+                    http_options=genai_types.HttpOptions(timeout=GENERATE_TIMEOUT_MS),
                 )
-                aborted_quota = True
-                break
+                process_one = self._process_one_gemini
+            prompt = cfg["prompt"]
+            model = cfg["model"]
+            delay = max(1, cfg["delay_seconds"])
+            self._dup_stems = self._find_duplicate_stems(files)
 
-            if idx < total and not self.stop_event.is_set():
-                time.sleep(delay)
+            for idx, path in enumerate(files, start=1):
+                if self.stop_event.is_set():
+                    self._log("Остановлено пользователем.", "warn")
+                    break
 
-        self.after(0, lambda: self._finish(processed, total, errors, aborted_quota))
+                self._log(f"[{idx}/{total}] Обработка {path.name}...")
+                try:
+                    ok, quota_exhausted = process_one(client, model, prompt, path, output_dir)
+                except _AbortBatch as e:
+                    processed += 1
+                    errors += 1
+                    self._log(f"✗ {e} Остановка пакета — остальные файлы завершились бы так же.", "err")
+                    abort_note = "неверный ключ или нет доступа к модели"
+                    break
+                processed += 1
+                if not ok:
+                    errors += 1
+
+                self._ui(self.progress.configure, value=idx)
+                self._ui(self.var_status.set, f"{idx}/{total}")
+
+                if quota_exhausted:
+                    if provider == "openai":
+                        self._log(
+                            "✗ Похоже, закончился баланс/квота OpenAI (insufficient_quota). "
+                            "Остановка пакета — повторные попытки не помогут, пополните баланс "
+                            "на platform.openai.com/settings/organization/billing.",
+                            "err",
+                        )
+                    else:
+                        self._log(
+                            "✗ Похоже, исчерпана суточная квота API (RESOURCE_EXHAUSTED, per-day). "
+                            "Остановка пакета — повторные попытки прямо сейчас не помогут, "
+                            "проверьте лимиты в AI Studio → Usage.",
+                            "err",
+                        )
+                    abort_note = "превышена суточная квота API"
+                    break
+
+                if idx < total and not self.stop_event.is_set():
+                    # wait() instead of sleep(): "Стоп" interrupts the pause at once
+                    self.stop_event.wait(delay)
+        except Exception as e:  # noqa: BLE001 - whatever happens, the UI must be released
+            self._log(f"✗ Непредвиденная ошибка, пакет остановлен: {e}", "err")
+            abort_note = "непредвиденная ошибка"
+        finally:
+            self.after(0, lambda: self._finish(processed, total, errors, abort_note))
 
     def _process_one_gemini(self, client, model: str, prompt: str, path: Path, output_dir: Path) -> tuple[bool, bool]:
         """Returns (success, daily_quota_exhausted)."""
@@ -1819,14 +1903,16 @@ class App(tk.Tk):
                         f"({attempt}/{MAX_RETRIES})...",
                         "warn",
                     )
-                    time.sleep(wait)
+                    self.stop_event.wait(wait)
                     continue
+                if _is_fatal_gemini_error(e):
+                    raise _AbortBatch(f"Google отклонил запрос: {e}")
                 self._log(f"  ✗ Ошибка API: {e}", "err")
                 return False, False
             except genai_errors.ServerError as e:
                 wait = min(MAX_BACKOFF_SECONDS, BASE_BACKOFF_SECONDS * attempt) + random.uniform(0, 2)
                 self._log(f"  ⚠ Ошибка сервера ({e.code}), повтор через {wait:.0f} сек...", "warn")
-                time.sleep(wait)
+                self.stop_event.wait(wait)
                 continue
             except httpx.TimeoutException:
                 wait = min(MAX_BACKOFF_SECONDS, BASE_BACKOFF_SECONDS * attempt) + random.uniform(0, 2)
@@ -1835,7 +1921,7 @@ class App(tk.Tk):
                     f"нестабильный VPN), повтор через {wait:.0f} сек ({attempt}/{MAX_RETRIES})...",
                     "warn",
                 )
-                time.sleep(wait)
+                self.stop_event.wait(wait)
                 continue
             except httpx.NetworkError as e:
                 wait = min(MAX_BACKOFF_SECONDS, BASE_BACKOFF_SECONDS * attempt) + random.uniform(0, 2)
@@ -1844,7 +1930,7 @@ class App(tk.Tk):
                     f"повтор через {wait:.0f} сек...",
                     "warn",
                 )
-                time.sleep(wait)
+                self.stop_event.wait(wait)
                 continue
             except Exception as e:  # noqa: BLE001
                 self._log(f"  ✗ Ошибка: {e}", "err")
@@ -1871,13 +1957,15 @@ class App(tk.Tk):
                     f"({attempt}/{MAX_RETRIES})...",
                     "warn",
                 )
-                time.sleep(wait)
+                self.stop_event.wait(wait)
                 continue
+            except (openai.AuthenticationError, openai.PermissionDeniedError, openai.NotFoundError) as e:
+                raise _AbortBatch(f"OpenAI отклонил запрос ({e.status_code}): {e.message}")
             except openai.APIStatusError as e:
                 if 500 <= (e.status_code or 0) < 600:
                     wait = min(MAX_BACKOFF_SECONDS, BASE_BACKOFF_SECONDS * attempt) + random.uniform(0, 2)
                     self._log(f"  ⚠ Ошибка сервера OpenAI ({e.status_code}), повтор через {wait:.0f} сек...", "warn")
-                    time.sleep(wait)
+                    self.stop_event.wait(wait)
                     continue
                 self._log(f"  ✗ Ошибка API OpenAI: {e}", "err")
                 return False, False
@@ -1888,7 +1976,7 @@ class App(tk.Tk):
                     f"повтор через {wait:.0f} сек ({attempt}/{MAX_RETRIES})...",
                     "warn",
                 )
-                time.sleep(wait)
+                self.stop_event.wait(wait)
                 continue
             except openai.APIConnectionError as e:
                 wait = min(MAX_BACKOFF_SECONDS, BASE_BACKOFF_SECONDS * attempt) + random.uniform(0, 2)
@@ -1896,7 +1984,7 @@ class App(tk.Tk):
                     f"  ⚠ Сетевая ошибка ({type(e).__name__}), повтор через {wait:.0f} сек...",
                     "warn",
                 )
-                time.sleep(wait)
+                self.stop_event.wait(wait)
                 continue
             except Exception as e:  # noqa: BLE001
                 self._log(f"  ✗ Ошибка: {e}", "err")
@@ -1912,7 +2000,7 @@ class App(tk.Tk):
                 self._log("  ✗ Модель не вернула изображение (возможно, промпт был отклонён).", "err")
                 return False
             item = items[0]
-            out_path = output_dir / f"{src_path.stem}.png"
+            out_path = output_dir / f"{self._out_stem(src_path)}.png"
             if getattr(item, "b64_json", None):
                 out_path.write_bytes(base64.b64decode(item.b64_json))
                 self._log(f"  ✓ Сохранено: {out_path.name}", "ok")
@@ -1938,7 +2026,7 @@ class App(tk.Tk):
                     inline = getattr(part, "inline_data", None)
                     if inline and inline.data:
                         ext = ".png" if "png" in (inline.mime_type or "") else ".jpg"
-                        out_path = output_dir / f"{src_path.stem}{ext}"
+                        out_path = output_dir / f"{self._out_stem(src_path)}{ext}"
                         out_path.write_bytes(inline.data)
                         self._log(f"  ✓ Сохранено: {out_path.name}", "ok")
                         return True

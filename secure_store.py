@@ -38,7 +38,7 @@ def encrypt(plaintext: str) -> str:
         ctypes.byref(data_in), None, ctypes.byref(entropy), None, None, 0, ctypes.byref(data_out)
     )
     if not ok:
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise ctypes.WinError()  # get_last_error() would report 0 here: windll isn't use_last_error
     try:
         raw = ctypes.string_at(data_out.pbData, data_out.cbData)
     finally:
